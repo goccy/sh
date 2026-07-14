@@ -382,6 +382,20 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 	if r.stop(ctx) {
 		return
 	}
+	// Bound interpreter recursion depth. Runtime recursion via functions or eval
+	// re-enters the interpreter without going through the parser, so it is not
+	// caught by the parser's recursion limit; left unbounded it overflows the
+	// goroutine stack, a fatal throw no recover can contain.
+	r.callDepth++
+	defer func() { r.callDepth-- }()
+	max := r.callDepthMax
+	if max <= 0 {
+		max = DefaultRecursionLimit
+	}
+	if r.callDepth > max {
+		r.exit.fatal(fmt.Errorf("exceeded maximum recursion depth of %d", max))
+		return
+	}
 
 	tracingEnabled := r.opts[optXTrace]
 	trace := r.tracer()

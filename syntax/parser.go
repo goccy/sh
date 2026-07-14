@@ -24,6 +24,21 @@ func KeepComments(enabled bool) ParserOption {
 	return func(p *Parser) { p.keepComments = enabled }
 }
 
+// DefaultRecursionLimit is the maximum depth of nested constructs the parser
+// descends when [RecursionLimit] is not set (or set to a non-positive value). It
+// is far below the depth that overflows a goroutine stack, yet far beyond any
+// realistic script.
+const DefaultRecursionLimit = 10000
+
+// RecursionLimit sets the maximum depth of nested constructs (parentheses,
+// command and arithmetic substitutions, test clauses, ...) the parser will
+// descend before failing with a parse error. Bounding the depth keeps deeply
+// nested input from overflowing the goroutine stack, which is a fatal runtime
+// throw that recover cannot catch. A value <= 0 selects [DefaultRecursionLimit].
+func RecursionLimit(max int) ParserOption {
+	return func(p *Parser) { p.recDepthMax = max }
+}
+
 // LangVariant describes a shell language variant to use when tokenizing and
 // parsing shell code. The zero value is [LangBash].
 //
@@ -232,8 +247,24 @@ func NewParser(options ...ParserOption) *Parser {
 	for _, opt := range options {
 		opt(p)
 	}
+	if p.recDepthMax <= 0 {
+		p.recDepthMax = DefaultRecursionLimit
+	}
 	return p
 }
+
+// enter descends one nesting level, failing the parse if the recursion limit is
+// exceeded (rather than overflowing the goroutine stack). Once the limit trips,
+// errPass forces EOF so the in-progress recursion unwinds. Callers must pair it
+// with a deferred [Parser.leave].
+func (p *Parser) enter() {
+	p.recDepth++
+	if p.recDepth > p.recDepthMax {
+		p.posErr(p.pos, "exceeded maximum recursion depth of %d", p.recDepthMax)
+	}
+}
+
+func (p *Parser) leave() { p.recDepth-- }
 
 // Parse reads and parses a shell program with an optional name. It
 // returns the parsed program if no issues were encountered. Otherwise,
@@ -511,6 +542,13 @@ type Parser struct {
 	recoveredErrors  int
 	recoverErrorsMax int
 
+	// recDepth is the current depth of nested constructs (parentheses, command
+	// substitutions, arithmetic, test clauses, ...); recDepthMax bounds it so that
+	// pathologically deep nesting fails with a parse error instead of overflowing
+	// the goroutine stack — a fatal runtime throw that no recover can catch.
+	recDepth    int
+	recDepthMax int
+
 	forbidNested bool
 
 	// list of pending heredoc bodies
@@ -567,6 +605,7 @@ func (p *Parser) reset() {
 	p.err, p.readErr, p.readEOF = nil, nil, false
 	p.quote, p.forbidNested = noState, false
 	p.openNodes = 0
+	p.recDepth = 0
 	p.recoveredErrors = 0
 	p.heredocs, p.buriedHdocs = p.heredocs[:0], 0
 	p.hdocStops = nil
@@ -1193,6 +1232,8 @@ func (p *Parser) ensureNoNested(pos Pos) {
 }
 
 func (p *Parser) wordPart() WordPart {
+	p.enter()
+	defer p.leave()
 	switch p.tok {
 	case _Lit, _LitWord, _LitRedir:
 		l := p.lit(p.pos, p.val)
@@ -2082,6 +2123,8 @@ func (p *Parser) doRedirect(s *Stmt) {
 }
 
 func (p *Parser) getStmt(readEnd, binCmd, fnBody bool) *Stmt {
+	p.enter()
+	defer p.leave()
 	pos, ok := p.gotRsrv("!")
 	s := &Stmt{Position: pos}
 	if ok {
@@ -2612,6 +2655,8 @@ func (p *Parser) testClause(s *Stmt) {
 }
 
 func (p *Parser) testExprBinary(pastAndOr bool) TestExpr {
+	p.enter()
+	defer p.leave()
 	p.got(_Newl)
 	var left TestExpr
 	if pastAndOr {

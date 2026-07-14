@@ -73,6 +73,15 @@ type Runner struct {
 
 	alias map[string]alias
 
+	// callDepth is the current interpreter recursion depth — nested command,
+	// function, eval and subshell execution. callDepthMax bounds it so that
+	// unbounded runtime recursion (e.g. a self-calling function or a self-eval)
+	// fails with a fatal error instead of overflowing the goroutine stack, which
+	// is a fatal runtime throw that no recover can catch. callDepthMax <= 0 selects
+	// DefaultRecursionLimit.
+	callDepth    int
+	callDepthMax int
+
 	// callHandler is a function allowing to replace a simple command's
 	// arguments. It may be nil.
 	callHandler CallHandlerFunc
@@ -419,6 +428,24 @@ func Params(args ...string) RunnerOption {
 func CallHandler(f CallHandlerFunc) RunnerOption {
 	return func(r *Runner) error {
 		r.callHandler = f
+		return nil
+	}
+}
+
+// DefaultRecursionLimit is the interpreter recursion depth used when
+// [RecursionLimit] is not set (or set to a non-positive value). It is far below
+// the depth that overflows a goroutine stack, yet far beyond any realistic
+// script's function or eval nesting.
+const DefaultRecursionLimit = 3000
+
+// RecursionLimit sets the maximum interpreter recursion depth — nested command,
+// function, eval and subshell execution — before a fatal error is raised.
+// Bounding the depth keeps unbounded runtime recursion (a self-calling function
+// or a self-eval) from overflowing the goroutine stack, a fatal runtime throw
+// that recover cannot catch. A value <= 0 selects [DefaultRecursionLimit].
+func RecursionLimit(max int) RunnerOption {
+	return func(r *Runner) error {
+		r.callDepthMax = max
 		return nil
 	}
 }
@@ -799,6 +826,7 @@ func (r *Runner) Reset() {
 		openHandler:    r.openHandler,
 		readDirHandler: r.readDirHandler,
 		statHandler:    r.statHandler,
+		callDepthMax:   r.callDepthMax, // config; callDepth resets to 0
 
 		// These can be set by functions like [Dir] or [Params], but
 		// builtins can overwrite them; reset the fields to whatever the
@@ -985,6 +1013,8 @@ func (r *Runner) subshell(background bool) *Runner {
 		openHandler:    r.openHandler,
 		readDirHandler: r.readDirHandler,
 		statHandler:    r.statHandler,
+		callDepth:      r.callDepth,
+		callDepthMax:   r.callDepthMax,
 		stdin:          r.stdin,
 		stdout:         r.stdout,
 		stderr:         r.stderr,

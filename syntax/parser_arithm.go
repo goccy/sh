@@ -3,6 +3,8 @@ package syntax
 // compact specifies whether we allow spaces between expressions.
 // This is true for let
 func (p *Parser) arithmExpr(compact bool) ArithmExpr {
+	p.enter()
+	defer p.leave()
 	return p.arithmExprComma(compact)
 }
 
