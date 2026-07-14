@@ -520,8 +520,8 @@ func stdinFile(r io.Reader) (*os.File, error) {
 			return nil, err
 		}
 		go func() {
+			defer func() { _ = recover(); pw.Close() }() // goccy/sh fork: never crash the host
 			io.Copy(pw, r)
-			pw.Close()
 		}()
 		return pr, nil
 	}

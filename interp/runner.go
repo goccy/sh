@@ -112,6 +112,11 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 			r.bgProcs = append(r.bgProcs, bg)
 			go func() {
 				defer func() {
+					// goccy/sh fork: contain a panic on this process-substitution
+					// goroutine as a fatal exit instead of crashing the host.
+					if p := recover(); p != nil {
+						r2.exit.fatal(fmt.Errorf("recovered panic: %v", p))
+					}
 					*bg.exit = r2.exit
 					close(bg.done)
 				}()
@@ -316,10 +321,18 @@ func (r *Runner) stmt(ctx context.Context, st *syntax.Stmt) {
 		}
 		r.bgProcs = append(r.bgProcs, bg)
 		go func() {
+			// goccy/sh fork: contain a panic on this background-job goroutine
+			// (which no embedder recover can reach) as a fatal exit instead of
+			// crashing the host process.
+			defer func() {
+				if p := recover(); p != nil {
+					r2.exit.fatal(fmt.Errorf("recovered panic: %v", p))
+				}
+				r2.exit.exiting = false // subshells don't exit the parent shell
+				*bg.exit = r2.exit
+				close(bg.done)
+			}()
 			r2.Run(ctx, &st2)
-			r2.exit.exiting = false // subshells don't exit the parent shell
-			*bg.exit = r2.exit
-			close(bg.done)
 		}()
 	} else {
 		r.stmtSync(ctx, st)
@@ -497,9 +510,16 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 			r.stdin = pr
 			var wg sync.WaitGroup
 			wg.Go(func() {
+				// goccy/sh fork: contain a panic on this pipeline-stage goroutine
+				// as a fatal exit instead of crashing the host process.
+				defer func() {
+					if p := recover(); p != nil {
+						r2.exit.fatal(fmt.Errorf("recovered panic: %v", p))
+					}
+					r2.exit.exiting = false // subshells don't exit the parent shell
+					pw.Close()
+				}()
 				r2.stmt(ctx, cm.X)
-				r2.exit.exiting = false // subshells don't exit the parent shell
-				pw.Close()
 			})
 			r.stmt(ctx, cm.Y)
 			pr.Close()
@@ -906,8 +926,8 @@ func (r *Runner) hdocReader(rd *syntax.Redirect) (*os.File, error) {
 	if rd.Op != syntax.DashHdoc {
 		hdoc := r.document(rd.Hdoc)
 		go func() {
+			defer func() { _ = recover(); pw.Close() }() // goccy/sh fork: never crash the host
 			pw.WriteString(hdoc)
-			pw.Close()
 		}()
 		return pr, nil
 	}
@@ -939,8 +959,8 @@ func (r *Runner) hdocReader(rd *syntax.Redirect) (*os.File, error) {
 	}
 	flushLine()
 	go func() {
+		defer func() { _ = recover(); pw.Close() }() // goccy/sh fork: never crash the host
 		pw.Write(buf.Bytes())
-		pw.Close()
 	}()
 	return pr, nil
 }
@@ -980,9 +1000,9 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 		// We write to the pipe in a new goroutine,
 		// as pipe writes may block once the buffer gets full.
 		go func() {
+			defer func() { _ = recover(); pw.Close() }() // goccy/sh fork: never crash the host
 			pw.WriteString(arg)
 			pw.WriteString("\n")
-			pw.Close()
 		}()
 		return pr, nil
 	case syntax.DplOut:
