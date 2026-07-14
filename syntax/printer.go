@@ -12,7 +12,7 @@ import (
 	"text/tabwriter"
 	"unicode"
 
-	"mvdan.cc/sh/v3/fileutil"
+	"github.com/goccy/sh/v3/fileutil"
 )
 
 // PrinterOption is a function which can be passed to NewPrinter

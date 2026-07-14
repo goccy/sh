@@ -15,8 +15,8 @@ import (
 
 	"golang.org/x/term"
 
-	"mvdan.cc/sh/v3/interp"
-	"mvdan.cc/sh/v3/syntax"
+	"github.com/goccy/sh/v3/interp"
+	"github.com/goccy/sh/v3/syntax"
 )
 
 var command = flag.String("c", "", "command to be executed")

@@ -22,10 +22,10 @@ import (
 	"sync"
 	"time"
 
-	"mvdan.cc/sh/v3/expand"
-	"mvdan.cc/sh/v3/internal"
-	"mvdan.cc/sh/v3/pattern"
-	"mvdan.cc/sh/v3/syntax"
+	"github.com/goccy/sh/v3/expand"
+	"github.com/goccy/sh/v3/internal"
+	"github.com/goccy/sh/v3/pattern"
+	"github.com/goccy/sh/v3/syntax"
 )
 
 const (

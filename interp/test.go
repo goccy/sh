@@ -11,8 +11,8 @@ import (
 
 	"golang.org/x/term"
 
-	"mvdan.cc/sh/v3/expand"
-	"mvdan.cc/sh/v3/syntax"
+	"github.com/goccy/sh/v3/expand"
+	"github.com/goccy/sh/v3/syntax"
 )
 
 // non-empty string is true, empty string is false

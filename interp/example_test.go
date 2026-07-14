@@ -10,9 +10,9 @@ import (
 	"os"
 	"strings"
 
-	"mvdan.cc/sh/v3/expand"
-	"mvdan.cc/sh/v3/interp"
-	"mvdan.cc/sh/v3/syntax"
+	"github.com/goccy/sh/v3/expand"
+	"github.com/goccy/sh/v3/interp"
+	"github.com/goccy/sh/v3/syntax"
 )
 
 func Example() {
