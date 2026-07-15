@@ -82,6 +82,10 @@ type Runner struct {
 	callDepth    int
 	callDepthMax int
 
+	// expandMaxBytes bounds the bytes a single expansion may produce (see
+	// [Config.MaxBytes]); <= 0 selects DefaultExpandBytes.
+	expandMaxBytes int64
+
 	// callHandler is a function allowing to replace a simple command's
 	// arguments. It may be nil.
 	callHandler CallHandlerFunc
@@ -446,6 +450,23 @@ const DefaultRecursionLimit = 3000
 func RecursionLimit(max int) RunnerOption {
 	return func(r *Runner) error {
 		r.callDepthMax = max
+		return nil
+	}
+}
+
+// DefaultExpandBytes is the per-expansion byte limit used when [MaxExpandBytes]
+// is not set. It is a safety ceiling against amplifying input, not the intended
+// limit; set MaxExpandBytes to the smallest value your workload needs.
+const DefaultExpandBytes = 256 << 20 // 256 MiB
+
+// MaxExpandBytes bounds the number of bytes a single expansion may produce — one
+// field set, one printf output, one joined word (see [Config.MaxBytes]). It
+// guards against amplification, where a small input expands into a huge
+// allocation that would exhaust host memory with an uncatchable OOM. A value
+// <= 0 selects [DefaultExpandBytes].
+func MaxExpandBytes(n int64) RunnerOption {
+	return func(r *Runner) error {
+		r.expandMaxBytes = n
 		return nil
 	}
 }
@@ -827,6 +848,7 @@ func (r *Runner) Reset() {
 		readDirHandler: r.readDirHandler,
 		statHandler:    r.statHandler,
 		callDepthMax:   r.callDepthMax, // config; callDepth resets to 0
+		expandMaxBytes: r.expandMaxBytes,
 
 		// These can be set by functions like [Dir] or [Params], but
 		// builtins can overwrite them; reset the fields to whatever the
@@ -1015,6 +1037,7 @@ func (r *Runner) subshell(background bool) *Runner {
 		statHandler:    r.statHandler,
 		callDepth:      r.callDepth,
 		callDepthMax:   r.callDepthMax,
+		expandMaxBytes: r.expandMaxBytes,
 		stdin:          r.stdin,
 		stdout:         r.stdout,
 		stderr:         r.stderr,

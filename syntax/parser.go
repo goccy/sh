@@ -259,8 +259,12 @@ func NewParser(options ...ParserOption) *Parser {
 // with a deferred [Parser.leave].
 func (p *Parser) enter() {
 	p.recDepth++
-	if p.recDepth > p.recDepthMax {
-		p.posErr(p.pos, "exceeded maximum recursion depth of %d", p.recDepthMax)
+	max := p.recDepthMax
+	if max <= 0 { // a zero-value Parser (not built via NewParser) still gets a bound
+		max = DefaultRecursionLimit
+	}
+	if p.recDepth > max {
+		p.posErr(p.pos, "exceeded maximum recursion depth of %d", max)
 	}
 }
 
@@ -1469,6 +1473,13 @@ func (p *Parser) dblQuoted() *DblQuoted {
 // does not form a valid parameter expansion, in which case it should be parsed
 // as a literal.
 func (p *Parser) paramExp() *ParamExp {
+	// Zsh nested parameter expansions (${${…}}) recurse paramExp ->
+	// paramExpParameter -> paramExp without going back through wordPart, so this
+	// is where the shared recursion guard must count them; otherwise a deeply
+	// nested input overflows the stack at parse time (an uncatchable throw). Other
+	// language variants reject nesting up front, but the guard is harmless there.
+	p.enter()
+	defer p.leave()
 	old := p.quote
 	p.quote = runeByRune
 	// [ParamExp.Short] means we are parsing $exp rather than ${exp}.
@@ -2125,6 +2136,19 @@ func (p *Parser) doRedirect(s *Stmt) {
 func (p *Parser) getStmt(readEnd, binCmd, fnBody bool) *Stmt {
 	p.enter()
 	defer p.leave()
+	// The && / || chain below is built in a loop, so recDepth would not climb
+	// with the operator count; a chain like a&&a&&…&&a would then produce a
+	// left-nested BinaryCmd tree of unbounded depth. Runtime execution is bounded
+	// by the interpreter's call-depth guard, but other walkers of the tree (e.g.
+	// the printer, reached via `declare -f`) recurse without one and would
+	// overflow the stack — an uncatchable throw. Count each link so the shared
+	// recursion guard bounds the chain length; the levels are released on return.
+	entered := 0
+	defer func() {
+		for ; entered > 0; entered-- {
+			p.leave()
+		}
+	}()
 	pos, ok := p.gotRsrv("!")
 	s := &Stmt{Position: pos}
 	if ok {
@@ -2146,6 +2170,8 @@ func (p *Parser) getStmt(readEnd, binCmd, fnBody bool) *Stmt {
 			// right recursion should only read a single element
 			return s
 		}
+		p.enter()
+		entered++
 		b := &BinaryCmd{
 			OpPos: p.pos,
 			Op:    BinCmdOperator(p.tok),
@@ -2197,6 +2223,17 @@ func (p *Parser) getStmt(readEnd, binCmd, fnBody bool) *Stmt {
 
 func (p *Parser) gotStmtPipe(s *Stmt, binCmd bool) *Stmt {
 	s.Comments, p.accComs = p.accComs, nil
+	// The pipe chain below is built in a loop rather than by recursion, so, as in
+	// getStmt's && / || loop, a chain like a|a|…|a would produce a left-nested
+	// BinaryCmd tree of unbounded depth that a depth-unguarded walker (the printer
+	// reached via `declare -f`) overflows the stack on. Count each pipe link so the
+	// shared recursion guard bounds the chain length; released on return.
+	entered := 0
+	defer func() {
+		for ; entered > 0; entered-- {
+			p.leave()
+		}
+	}()
 	for p.peekRedir() {
 		p.doRedirect(s)
 	}
@@ -2360,6 +2397,8 @@ func (p *Parser) gotStmtPipe(s *Stmt, binCmd bool) *Stmt {
 			// we parse |& as two tokens.
 			break
 		}
+		p.enter()
+		entered++
 		b := &BinaryCmd{OpPos: p.pos, Op: BinCmdOperator(p.tok), X: s}
 		p.next()
 		p.got(_Newl)
@@ -2419,6 +2458,17 @@ func (p *Parser) block(s *Stmt) {
 }
 
 func (p *Parser) ifClause(s *Stmt) {
+	// elif/else are linked through IfClause.Else and built in a loop, so recDepth
+	// would not climb with the chain length; an elif chain of N would then nest N
+	// deep and overflow a depth-unguarded walker of the .Else chain (the printer,
+	// reached via `declare -f`). Count each link so the shared recursion guard
+	// bounds the chain; the levels are released once the whole clause is parsed.
+	entered := 0
+	defer func() {
+		for ; entered > 0; entered-- {
+			p.leave()
+		}
+	}()
 	rootIf := &IfClause{Position: p.pos}
 	p.next()
 	rootIf.Cond, rootIf.CondLast = p.followStmts("if", rootIf.Position, "then")
@@ -2426,6 +2476,8 @@ func (p *Parser) ifClause(s *Stmt) {
 	rootIf.Then, rootIf.ThenLast = p.followStmts("then", rootIf.ThenPos, "fi", "elif", "else")
 	curIf := rootIf
 	for p.tok == _LitWord && p.val == "elif" {
+		p.enter()
+		entered++
 		elf := &IfClause{Position: p.pos}
 		curIf.Last = p.accComs
 		p.accComs = nil
@@ -2437,6 +2489,8 @@ func (p *Parser) ifClause(s *Stmt) {
 		curIf = elf
 	}
 	if elsePos, ok := p.gotRsrv("else"); ok {
+		p.enter()
+		entered++
 		curIf.Last = p.accComs
 		p.accComs = nil
 		els := &IfClause{Position: elsePos}
@@ -2811,6 +2865,10 @@ func isBashCompoundCommand(tok token, val string) bool {
 }
 
 func (p *Parser) timeClause(s *Stmt) {
+	// time/coproc recurse into gotStmtPipe directly, never re-entering the guarded
+	// getStmt, so they need their own depth guard (e.g. "time time time … cmd").
+	p.enter()
+	defer p.leave()
 	tc := &TimeClause{Time: p.pos}
 	p.next()
 	if _, ok := p.gotRsrv("-p"); ok {
@@ -2821,6 +2879,8 @@ func (p *Parser) timeClause(s *Stmt) {
 }
 
 func (p *Parser) coprocClause(s *Stmt) {
+	p.enter()
+	defer p.leave()
 	cc := &CoprocClause{Coproc: p.pos}
 	if p.next(); isBashCompoundCommand(p.tok, p.val) {
 		// has no name

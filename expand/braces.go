@@ -22,12 +22,36 @@ import (
 // error rather than letting a large sequence allocate huge amounts.
 func Braces(word *syntax.Word) []*syntax.Word {
 	var all []*syntax.Word
-	bracesSeqRec(word, func(w *syntax.Word) bool {
+	bracesSeqRec(word, 0, func(w *syntax.Word, err error) bool {
+		// The deprecated API has no error channel; stop safely on an error or once
+		// the element count reaches the same bound BracesSeq enforces, so a huge
+		// sequence like {1..9999999999} cannot exhaust memory here either.
+		if err != nil || len(all) >= maxBraceElems {
+			return false
+		}
 		all = append(all, w)
 		return true
 	})
 	return all
 }
+
+// maxBraceDepth bounds how deeply brace expansions may nest. Unlike the width
+// limit in [BracesSeq], depth is not visible to the yield callback (left-nested
+// input like {{{…,z},z},z} descends fully before yielding a single word), so
+// bracesSeqRec must bound its own recursion or a deep literal overflows the
+// goroutine stack — a fatal, unrecoverable runtime throw.
+const maxBraceDepth = 16 << 10
+
+// maxBraceElems bounds the number of words a single brace expansion may yield —
+// a guard against combinatorial blow-ups like {1..100}{1..100}{1..100}.
+const maxBraceElems = 16 << 10
+
+// maxBraceSeqPad bounds the zero-padding width of a numeric brace sequence
+// ({0001..9}). The width is attacker-controlled and applied to every generated
+// element, so without a bound a tiny input (many leading zeros) allocates memory
+// proportional to width times the element count — an amplification that can
+// exhaust host memory (an uncatchable OOM). Real padding is a handful of digits.
+const maxBraceSeqPad = 256
 
 // BracesSeq performs brace expansion on a word, given that it contains any
 // [syntax.BraceExp] parts. For example, the word with a brace expansion
@@ -41,14 +65,17 @@ func Braces(word *syntax.Word) []*syntax.Word {
 // Note that the resulting words may share word parts.
 func BracesSeq(cfg *Config, word *syntax.Word) iter.Seq2[*syntax.Word, error] {
 	return func(yield func(*syntax.Word, error) bool) {
-		// 16Ki expanded elements is more than any script should need in practice,
-		// but it's small enough where we don't waste too much memory and CPU.
-		const limit = 16 << 10
+		// maxBraceElems expanded elements is more than any script should need in
+		// practice, but small enough that we don't waste too much memory and CPU.
 		count := 0
-		bracesSeqRec(word, func(w *syntax.Word) bool {
+		bracesSeqRec(word, 0, func(w *syntax.Word, err error) bool {
+			if err != nil {
+				yield(nil, err)
+				return false
+			}
 			count++
-			if count > limit {
-				yield(nil, fmt.Errorf("brace expansion would exceed %d elements", limit))
+			if count > maxBraceElems {
+				yield(nil, fmt.Errorf("brace expansion would exceed %d elements", maxBraceElems))
 				return false
 			}
 			return yield(w, nil)
@@ -56,9 +83,14 @@ func BracesSeq(cfg *Config, word *syntax.Word) iter.Seq2[*syntax.Word, error] {
 	}
 }
 
-// bracesSeqRec yields each fully-expanded word descended from word.
-// It returns false if iteration should stop.
-func bracesSeqRec(word *syntax.Word, yield func(*syntax.Word) bool) bool {
+// bracesSeqRec yields each fully-expanded word descended from word. It yields a
+// non-nil error (and stops) if the brace nesting exceeds maxBraceDepth, so deep
+// input fails gracefully instead of overflowing the goroutine stack. It returns
+// false if iteration should stop.
+func bracesSeqRec(word *syntax.Word, depth int, yield func(*syntax.Word, error) bool) bool {
+	if depth > maxBraceDepth {
+		return yield(nil, fmt.Errorf("brace expansion nested more than %d deep", maxBraceDepth))
+	}
 	var left []syntax.WordPart
 	for i, wp := range word.Parts {
 		br, ok := wp.(*syntax.BraceExp)
@@ -70,15 +102,21 @@ func bracesSeqRec(word *syntax.Word, yield func(*syntax.Word) bool) bool {
 		// Yield each word produced by recursing on `next`,
 		// after prepending `left` to its Parts.
 		expand := func(next *syntax.Word) bool {
-			return bracesSeqRec(next, func(w *syntax.Word) bool {
+			return bracesSeqRec(next, depth+1, func(w *syntax.Word, err error) bool {
+				if err != nil {
+					return yield(nil, err)
+				}
 				w.Parts = append(append([]syntax.WordPart(nil), left...), w.Parts...)
-				return yield(w)
+				return yield(w, nil)
 			})
 		}
 		if br.Sequence {
 			fromLit := br.Elems[0].Lit()
 			toLit := br.Elems[1].Lit()
 			zeros := max(extraLeadingZeros(fromLit), extraLeadingZeros(toLit))
+			if zeros > maxBraceSeqPad {
+				return yield(nil, fmt.Errorf("brace expansion zero-padding exceeds %d digits", maxBraceSeqPad))
+			}
 
 			chars := false
 			// ParseInt with bit size 64 to ensure consistent behavior on 32-bit platforms.
@@ -125,7 +163,7 @@ func bracesSeqRec(word *syntax.Word, yield func(*syntax.Word) bool) bool {
 		}
 		return true
 	}
-	return yield(&syntax.Word{Parts: left})
+	return yield(&syntax.Word{Parts: left}, nil)
 }
 
 func extraLeadingZeros(s string) int {

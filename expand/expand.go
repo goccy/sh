@@ -87,6 +87,15 @@ type Config struct {
 	// pattern matching features when performing pathname expansion (globbing).
 	ExtGlob bool
 
+	// MaxBytes, if positive, bounds the number of bytes a single expansion may
+	// produce — one field set, one printf output, one joined word. It guards
+	// against amplification (a small input that expands into a huge allocation,
+	// e.g. printf with many wide specifiers, a brace expansion whose elements each
+	// concatenate a large value, or repeated self-concatenation), which would
+	// otherwise exhaust host memory with an uncatchable OOM. A non-positive value
+	// means unlimited.
+	MaxBytes int64
+
 	bufferAlloc strings.Builder
 	fieldAlloc  [4]fieldPart
 	fieldsAlloc [4][]fieldPart
@@ -187,6 +196,9 @@ func Literal(cfg *Config, word *syntax.Word) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if cfg.tooLarge(cfg.fieldBytes(field)) {
+		return "", fmt.Errorf("expansion exceeds the %d-byte limit", cfg.MaxBytes)
+	}
 	return cfg.fieldJoin(field), nil
 }
 
@@ -205,6 +217,9 @@ func Document(cfg *Config, word *syntax.Word) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if cfg.tooLarge(cfg.fieldBytes(field)) {
+		return "", fmt.Errorf("expansion exceeds the %d-byte limit", cfg.MaxBytes)
+	}
 	return cfg.fieldJoin(field), nil
 }
 
@@ -222,6 +237,9 @@ func Pattern(cfg *Config, word *syntax.Word) (string, error) {
 	field, err := cfg.wordField(word.Parts, quoteNone)
 	if err != nil {
 		return "", err
+	}
+	if cfg.tooLargePattern(cfg.fieldBytes(field)) {
+		return "", fmt.Errorf("pattern exceeds the %d-byte limit", cfg.MaxBytes/patternRegexpFactor)
 	}
 	sb := cfg.strBuilder()
 	for _, part := range field {
@@ -248,7 +266,7 @@ func Format(cfg *Config, format string, args []string) (string, int, error) {
 	cfg = prepareConfig(cfg)
 	sb := cfg.strBuilder()
 
-	consumed, err := formatInto(sb, format, args)
+	consumed, err := formatInto(sb, format, args, cfg.MaxBytes)
 	if err != nil {
 		return "", 0, err
 	}
@@ -256,11 +274,18 @@ func Format(cfg *Config, format string, args []string) (string, int, error) {
 	return sb.String(), consumed, err
 }
 
-func formatInto(sb *strings.Builder, format string, args []string) (int, error) {
+func formatInto(sb *strings.Builder, format string, args []string, maxBytes int64) (int, error) {
 	var fmts []byte
 	initialArgs := len(args)
 
 	for i := 0; i < len(format); i++ {
+		// A single format can emit an unbounded number of wide specifiers
+		// (%1000000d…), each writing up to fmt's 1e6-byte width cap. Bound the
+		// running output so a small format string cannot build a huge string and
+		// exhaust host memory.
+		if maxBytes > 0 && int64(sb.Len()) > maxBytes {
+			return 0, fmt.Errorf("printf output exceeds the %d-byte limit", maxBytes)
+		}
 		// readDigits reads from 0 to max digits, either octal or
 		// hexadecimal.
 		readDigits := func(max int, hex bool) string {
@@ -370,7 +395,7 @@ func formatInto(sb *strings.Builder, format string, args []string) (int, error) 
 					// Passing in nil for args ensures that % format
 					// strings aren't processed; only escape sequences
 					// will be handled.
-					_, err := formatInto(sb, arg, nil)
+					_, err := formatInto(sb, arg, nil, maxBytes)
 					if err != nil {
 						return 0, err
 					}
@@ -409,6 +434,55 @@ func formatInto(sb *strings.Builder, format string, args []string) (int, error) 
 	return initialArgs - len(args), nil
 }
 
+// fieldBytes is the number of bytes joining parts would allocate.
+func (cfg *Config) fieldBytes(parts []fieldPart) int64 {
+	var n int64
+	for _, part := range parts {
+		n += int64(len(part.val))
+	}
+	return n
+}
+
+// tooLarge reports whether n exceeds the configured MaxBytes.
+func (cfg *Config) tooLarge(n int64) bool {
+	return cfg.MaxBytes > 0 && n > cfg.MaxBytes
+}
+
+// patternRegexpFactor is a conservative upper bound on how much larger a compiled
+// regexp is than its source pattern (Go's regexp runs ~137x in the worst case).
+const patternRegexpFactor = 256
+
+// tooLargePattern reports whether a pattern of n bytes would compile to a regexp
+// that overshoots MaxBytes. Because pattern compilation amplifies size sharply,
+// the effective pattern budget is MaxBytes/patternRegexpFactor.
+func (cfg *Config) tooLargePattern(n int64) bool {
+	return cfg.MaxBytes > 0 && n > cfg.MaxBytes/patternRegexpFactor
+}
+
+// transformWorkFactor bounds value-transform operators (case folding ${x^^},
+// ANSI-C unescape ${x@E}, quoting ${x@Q}/@A/@u): their working set — a []rune
+// copy (4 bytes/rune) plus per-rune churn — runs several times the value size,
+// so even a budget-sized value can transiently allocate far past MaxBytes.
+const transformWorkFactor = 12
+
+// tooLargeTransform reports whether transforming a value of n bytes would blow
+// past MaxBytes in working set.
+func (cfg *Config) tooLargeTransform(n int64) bool {
+	return cfg.MaxBytes > 0 && n > cfg.MaxBytes/transformWorkFactor
+}
+
+// matchIndexFactor bounds ${x//pat/repl}: regexp.FindAllStringIndex allocates a
+// two-int slice (~48 bytes on 64-bit) per match, and a pattern matching every
+// position yields len(subject) matches, so the match-index array alone is ~48x
+// the subject. Bound the subject so that array cannot exceed MaxBytes.
+const matchIndexFactor = 64
+
+// tooLargeMatch reports whether globally matching a pattern over an n-byte
+// subject could allocate a match-index array past MaxBytes.
+func (cfg *Config) tooLargeMatch(n int64) bool {
+	return cfg.MaxBytes > 0 && n > cfg.MaxBytes/matchIndexFactor
+}
+
 func (cfg *Config) fieldJoin(parts []fieldPart) string {
 	switch len(parts) {
 	case 0:
@@ -444,11 +518,27 @@ func (cfg *Config) escapedGlobField(parts []fieldPart) (escaped string, glob boo
 // Fields is a pre-iterators API which now wraps [FieldsSeq].
 func Fields(cfg *Config, words ...*syntax.Word) ([]string, error) {
 	var fields []string
+	var total int64
+	maxFields := -1
+	if cfg != nil {
+		maxFields = fieldCountLimit(cfg.MaxBytes)
+	}
 	for s, err := range FieldsSeq(cfg, words...) {
 		if err != nil {
 			return nil, err
 		}
+		if cfg != nil {
+			total += int64(len(s))
+			if cfg.tooLarge(total) {
+				return nil, fmt.Errorf("expansion exceeds the %d-byte limit", cfg.MaxBytes)
+			}
+		}
 		fields = append(fields, s)
+		// Bound the accumulated field count across all words (wordFields bounds a
+		// single word); each field costs a header regardless of its byte length.
+		if maxFields >= 0 && len(fields) > maxFields {
+			return nil, fmt.Errorf("expansion produces too many fields (limit %d)", maxFields)
+		}
 	}
 	return fields, nil
 }
@@ -487,6 +577,13 @@ func FieldsSeq(cfg *Config, words ...*syntax.Word) iter.Seq2[string, error] {
 						}
 						continue
 					}
+				}
+				// Bound the join before it materializes: a word of many parts
+				// (echo $x$x…$x) concatenates to numParts*partSize regardless of the
+				// per-part budget. Mirrors Literal/Document.
+				if cfg.tooLarge(cfg.fieldBytes(field)) {
+					yield("", fmt.Errorf("expansion exceeds the %d-byte limit", cfg.MaxBytes))
+					return true
 				}
 				if !yield(cfg.fieldJoin(field), nil) {
 					return true
@@ -531,7 +628,9 @@ const (
 
 func (cfg *Config) wordField(wps []syntax.WordPart, ql quoteLevel) ([]fieldPart, error) {
 	var field []fieldPart
+	var total int64
 	for i, wp := range wps {
+		before := len(field)
 		switch wp := wp.(type) {
 		case *syntax.Lit:
 			s := wp.Value
@@ -612,6 +711,16 @@ func (cfg *Config) wordField(wps []syntax.WordPart, ql quoteLevel) ([]fieldPart,
 		default:
 			panic(fmt.Sprintf("unhandled word part: %T", wp))
 		}
+		// Bound the parts as they accumulate: a word of many fresh parts
+		// (${x^^}${x^^}… or $x$x…) would otherwise hold numParts*partSize before
+		// any post-hoc join check runs. Summing only the newly-added parts keeps
+		// this O(number of parts).
+		for _, p := range field[before:] {
+			total += int64(len(p.val))
+		}
+		if cfg.tooLarge(total) {
+			return nil, fmt.Errorf("expansion exceeds the %d-byte limit", cfg.MaxBytes)
+		}
 	}
 	return field, nil
 }
@@ -621,28 +730,83 @@ func (cfg *Config) cmdSubst(cs *syntax.CmdSubst) (string, error) {
 		return "", UnexpectedCommandError{Node: cs}
 	}
 	sb := cfg.strBuilder()
-	if err := cfg.CmdSubst(sb, cs); err != nil {
+	// Cap the capture buffer as the subshell writes into it: a body that emits
+	// unbounded output (a loop, or a huge file via $(<file)) would otherwise fill
+	// this builder and exhaust host memory before any post-hoc check runs.
+	lb := &limitedBuilder{sb: sb, limit: cfg.MaxBytes}
+	if err := cfg.CmdSubst(lb, cs); err != nil {
 		return "", err
+	}
+	if lb.overflowed {
+		return "", fmt.Errorf("command substitution output exceeds the %d-byte limit", cfg.MaxBytes)
 	}
 	out := sb.String()
 	out = strings.ReplaceAll(out, "\x00", "")
 	return strings.TrimRight(out, "\n"), nil
 }
 
+// limitedBuilder caps how many bytes accumulate into a strings.Builder. Writes
+// past the limit are dropped (and flagged) rather than errored, so the writing
+// subshell is not itself broken — but the buffer never grows past the limit.
+type limitedBuilder struct {
+	sb         *strings.Builder
+	limit      int64
+	overflowed bool
+}
+
+func (l *limitedBuilder) Write(p []byte) (int, error) {
+	if l.limit > 0 {
+		if room := l.limit - int64(l.sb.Len()); room < int64(len(p)) {
+			l.overflowed = true
+			if room > 0 {
+				l.sb.Write(p[:room])
+			}
+			// Return an error so a streaming copier (io.Copy for $(<file), even an
+			// endless one like /dev/zero) stops instead of looping forever. A
+			// subshell's own writer (r.out) ignores this, so it just stops growing
+			// the buffer and finishes under the context deadline.
+			return int(max(room, 0)), errCaptureOverflow
+		}
+	}
+	return l.sb.Write(p)
+}
+
+// errCaptureOverflow stops a command-substitution capture once it reaches the
+// per-expansion byte limit.
+var errCaptureOverflow = errors.New("command substitution output exceeds the limit")
+
 func (cfg *Config) wordFields(wps []syntax.WordPart) ([][]fieldPart, error) {
 	fields := cfg.fieldsAlloc[:0]
 	curField := cfg.fieldAlloc[:0]
 	allowEmpty := false
+	// total bounds the bytes accumulated across all split fields, so a word of
+	// many dynamic parts (echo $x$x… / ${x^^}…) cannot hold numParts*partSize
+	// before the post-hoc join check runs.
+	var total int64
+	// Bound the field count too, not just the bytes: IFS-splitting a value of
+	// many tiny fields (IFS=:; set -- $x) allocates a slice header and fieldPart
+	// per field — a large multiple of the byte budget. Cap the count against
+	// MaxBytes (mirrors ReadFields), with a floor for tiny budgets. Once tripped,
+	// splitAdd and the parts loop bail so the allocation stays bounded.
+	maxFields := fieldCountLimit(cfg.MaxBytes)
+	overflow := false
 	flush := func() {
 		if len(curField) == 0 {
 			return
 		}
 		fields = append(fields, curField)
 		curField = nil
+		if maxFields >= 0 && len(fields) > maxFields {
+			overflow = true
+		}
 	}
 	splitAdd := func(val string) {
+		total += int64(len(val))
 		fieldStart := -1
 		for i, r := range val {
+			if overflow {
+				return
+			}
 			if cfg.ifsRune(r) {
 				if fieldStart >= 0 { // ending a field
 					curField = append(curField, fieldPart{val: val[fieldStart:i]})
@@ -660,6 +824,9 @@ func (cfg *Config) wordFields(wps []syntax.WordPart) ([][]fieldPart, error) {
 		}
 	}
 	for i, wp := range wps {
+		if overflow {
+			break
+		}
 		switch wp := wp.(type) {
 		case *syntax.Lit:
 			s := wp.Value
@@ -719,6 +886,7 @@ func (cfg *Config) wordFields(wps []syntax.WordPart) ([][]fieldPart, error) {
 			for _, part := range wfield {
 				part.quote = quoteDouble
 				curField = append(curField, part)
+				total += int64(len(part.val))
 			}
 		case *syntax.ParamExp:
 			val, err := cfg.paramExp(wp)
@@ -759,8 +927,14 @@ func (cfg *Config) wordFields(wps []syntax.WordPart) ([][]fieldPart, error) {
 		default:
 			panic(fmt.Sprintf("unhandled word part: %T", wp))
 		}
+		if cfg.tooLarge(total) {
+			return nil, fmt.Errorf("expansion exceeds the %d-byte limit", cfg.MaxBytes)
+		}
 	}
 	flush()
+	if overflow {
+		return nil, fmt.Errorf("expansion produces too many fields (limit %d)", maxFields)
+	}
 	if allowEmpty && len(fields) == 0 {
 		fields = append(fields, curField)
 	}
@@ -1119,12 +1293,57 @@ func (cfg *Config) globDir(base, dir string, matcher func(string) bool, wantDir 
 //
 // The config specifies shell expansion options; nil behaves the same as an
 // empty config.
+// readFieldsFloor is the minimum field cap [ReadFields] uses when a byte budget
+// is set. It sits above the interpreter's array element cap (1<<20) so that an
+// over-cap read -a line is rejected by the array check rather than silently
+// truncated in [ReadFields], while bounding the worst-case field allocation to
+// ~tens of MiB even for a tiny budget. The general field-splitting path
+// ([Fields]/[wordFields]) reports its own error, so it uses the tighter
+// [fieldCountLimit] without this floor.
+const readFieldsFloor = 1 << 21
+
+// fieldBytesPerField is a conservative estimate of the live memory one split
+// field costs: a []fieldPart header, one fieldPart struct, and a []string header
+// (~64 bytes total). Dividing the byte budget by it caps the field allocation to
+// roughly one times the budget.
+const fieldBytesPerField = 64
+
+// fieldCountLimit returns the maximum number of split fields to allow for the
+// given byte budget, or -1 when unbounded (maxBytes <= 0), so a value of many
+// tiny fields cannot allocate a large multiple of the budget in field overhead.
+func fieldCountLimit(maxBytes int64) int {
+	if maxBytes <= 0 {
+		return -1
+	}
+	if n := int(maxBytes / fieldBytesPerField); n >= 1 {
+		return n
+	}
+	return 1
+}
+
 func ReadFields(cfg *Config, s string, n int, raw bool) []string {
 	cfg = prepareConfig(cfg)
 	type pos struct {
 		start, end int
 	}
 	var fpos []pos
+
+	// Bound the number of fields against the byte budget. A line of many tiny
+	// fields (e.g. "a a a …") would otherwise build a position record and a
+	// string header per field — an unbounded multiple of the input that can
+	// exhaust host memory with an uncatchable throw (notably via read -a, which
+	// keeps every field). Each field costs on the order of tens of bytes, so
+	// capping the count at MaxBytes/16 keeps the allocation within the budget.
+	// The cap stays above any element cap the caller enforces (read -a rejects an
+	// over-cap array), so an over-budget line is rejected there, not truncated
+	// silently; the floor keeps the worst-case transient bounded regardless.
+	// read -a keeps every field and then runs the interpreter's array checks, so
+	// keep the cap above the array element cap (readFieldsFloor) — an over-cap
+	// line is then rejected there rather than silently truncated here.
+	maxFields := fieldCountLimit(cfg.MaxBytes)
+	if maxFields >= 0 && maxFields < readFieldsFloor {
+		maxFields = readFieldsFloor
+	}
 
 	runes := make([]rune, 0, len(s))
 	infield := false
@@ -1137,6 +1356,9 @@ func ReadFields(cfg *Config, s string, n int, raw bool) []string {
 			}
 		} else {
 			if !cfg.ifsRune(r) && (raw || !esc) {
+				if maxFields >= 0 && len(fpos) >= maxFields {
+					break // budget reached; stop collecting fields
+				}
 				fpos = append(fpos, pos{start: len(runes), end: -1})
 				infield = true
 			}

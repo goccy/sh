@@ -234,6 +234,69 @@ func (r *Runner) setVar(name string, vr expand.Variable) {
 	}
 }
 
+// maxArrayLen bounds the length of a densely-stored indexed array. The backing
+// slice grows to the largest index, so an unbounded attacker-supplied subscript
+// would allocate memory proportional to it (an uncatchable OOM). A million
+// elements is far beyond any real shell array yet keeps the allocation bounded.
+const maxArrayLen = 1 << 20
+
+// checkArrayList reports whether list exceeds the element-count cap or the
+// cumulative-byte budget (the per-expansion MaxBytes), setting a fatal error if
+// so. Per-element expansion is already bounded, but many near-budget elements
+// aggregate past it, so the total needs its own bound.
+//
+// The whole list is scanned on every call. An earlier version amortized the byte
+// scan to power-of-two lengths, but that admits an unbounded overshoot: a stream
+// of empty elements slips past a checkpoint at ~zero bytes, then large elements
+// added before the next power-of-two accumulate arbitrarily. The callers here
+// each already do work proportional to the list per assignment (a whole-array or
+// batch build, or a clone), so a full scan adds no asymptotic cost; the one path
+// that grows one element at a time (mapfile) tracks its own running total via
+// [Runner.checkArrayGrow] instead of calling this per element.
+func (r *Runner) checkArrayList(list []string) bool {
+	var total int64
+	for _, s := range list {
+		total += int64(len(s))
+	}
+	return r.checkArrayGrow(len(list), total)
+}
+
+// checkArrayGrow bounds an array's element count and cumulative byte total,
+// setting a fatal error if either is exceeded. It is O(1), for streaming callers
+// that maintain the running total as they append.
+func (r *Runner) checkArrayGrow(n int, totalBytes int64) bool {
+	if n > maxArrayLen {
+		r.exit.fatal(fmt.Errorf("array length %d exceeds the maximum of %d", n, maxArrayLen))
+		return true
+	}
+	if max := r.ecfg.MaxBytes; max > 0 && totalBytes > max {
+		r.exit.fatal(fmt.Errorf("array total size exceeds the %d-byte limit", max))
+		return true
+	}
+	return false
+}
+
+// checkArrayMap is checkArrayList for associative arrays, counting keys+values.
+func (r *Runner) checkArrayMap(m map[string]string) bool {
+	n := len(m)
+	if n > maxArrayLen {
+		r.exit.fatal(fmt.Errorf("associative array size %d exceeds the maximum of %d", n, maxArrayLen))
+		return true
+	}
+	max := r.ecfg.MaxBytes
+	if max <= 0 {
+		return false
+	}
+	var total int64
+	for k, v := range m {
+		if total += int64(len(k) + len(v)); total > max {
+			r.exit.fatal(fmt.Errorf("associative array total size exceeds the %d-byte limit", max))
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Runner) setVarWithIndex(prev expand.Variable, name string, index syntax.ArithmExpr, vr expand.Variable) {
 	if vr.Kind == expand.String && index == nil {
 		// When assigning a string to an array, fall back to the
@@ -280,14 +343,28 @@ func (r *Runner) setVarWithIndex(prev expand.Variable, name string, index syntax
 			prev.Map = make(map[string]string)
 		}
 		prev.Map[k] = valStr
+		if r.checkArrayMap(prev.Map) {
+			return
+		}
 		r.setVar(name, prev)
 		return
 	}
 	k := r.arithm(index)
+	// Indexed arrays are stored densely, so the backing slice grows to the
+	// largest index. Bound the index: an attacker-supplied k (e.g. a[50000000]=x)
+	// would otherwise allocate memory proportional to k — an uncatchable OOM that
+	// no context deadline can interrupt mid-grow.
+	if k >= maxArrayLen {
+		r.exit.fatal(fmt.Errorf("array subscript %d exceeds the maximum of %d", k, maxArrayLen))
+		return
+	}
 	for len(list) < k+1 {
 		list = append(list, "")
 	}
 	list[k] = valStr
+	if r.checkArrayList(list) {
+		return
+	}
 	prev.Kind = expand.Indexed
 	prev.List = list
 	r.setVar(name, prev)
@@ -366,6 +443,9 @@ func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign,
 			k := r.literal(elem.Index.(*syntax.Word))
 			amap[k] = r.literal(elem.Value)
 		}
+		if r.checkArrayMap(amap) {
+			return name, prev
+		}
 		if !as.Append {
 			prev.Kind = expand.Associative
 			prev.Map = amap
@@ -393,6 +473,12 @@ func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign,
 		index += len(elemValues[i].values)
 		maxIndex = max(maxIndex, index)
 	}
+	// Bound the dense backing slice: a literal like ([50000000]=x) would otherwise
+	// allocate memory proportional to the largest index — an uncatchable OOM.
+	if maxIndex > maxArrayLen {
+		r.exit.fatal(fmt.Errorf("array length %d exceeds the maximum of %d", maxIndex, maxArrayLen))
+		return name, prev
+	}
 	// Flatten down the values.
 	strs := make([]string, maxIndex)
 	for _, ev := range elemValues {
@@ -401,6 +487,9 @@ func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign,
 		}
 	}
 	if !as.Append {
+		if r.checkArrayList(strs) {
+			return name, prev
+		}
 		prev.Kind = expand.Indexed
 		prev.List = strs
 		return name, prev
@@ -419,6 +508,11 @@ func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign,
 	default:
 		// Should only happen if we forgot a case above.
 		panic(fmt.Sprintf("unexpected conversion of kind %d", prev.Kind))
+	}
+	// += must re-check the accumulated count (the maxIndex guard above only saw
+	// the new elements) and the cumulative bytes.
+	if r.checkArrayList(prev.List) {
+		return name, prev
 	}
 	return name, prev
 }

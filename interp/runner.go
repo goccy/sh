@@ -157,6 +157,13 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 			return path, nil
 		},
 	}
+	// Bound the bytes a single expansion may produce, so amplifying input cannot
+	// exhaust host memory. A non-positive setting selects the default.
+	mb := r.expandMaxBytes
+	if mb <= 0 {
+		mb = DefaultExpandBytes
+	}
+	r.ecfg.MaxBytes = mb
 	r.updateExpandOpts()
 }
 
@@ -945,14 +952,30 @@ func (r *Runner) hdocReader(rd *syntax.Redirect) (*os.File, error) {
 		}()
 		return pr, nil
 	}
+	// A dash heredoc expands line by line, each r.document call bounded to
+	// MaxBytes independently. The accumulated buffer must be bounded too, or the
+	// sum of individually in-budget lines could exhaust host memory with an
+	// uncatchable runtime throw. Cap the running total against the same budget;
+	// since each line is already ≤ MaxBytes, the buffer peaks below 2×MaxBytes.
+	maxBytes := r.ecfg.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultExpandBytes
+	}
 	var buf bytes.Buffer
 	var cur []syntax.WordPart
+	overflow := false
 	flushLine := func() {
+		if overflow {
+			return
+		}
 		if buf.Len() > 0 {
 			buf.WriteByte('\n')
 		}
 		buf.WriteString(r.document(&syntax.Word{Parts: cur}))
 		cur = cur[:0]
+		if int64(buf.Len()) > maxBytes {
+			overflow = true
+		}
 	}
 	for _, wp := range rd.Hdoc.Parts {
 		lit, ok := wp.(*syntax.Lit)
@@ -972,6 +995,11 @@ func (r *Runner) hdocReader(rd *syntax.Redirect) (*os.File, error) {
 		}
 	}
 	flushLine()
+	if overflow {
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, fmt.Errorf("here-document expansion exceeds %d bytes", maxBytes)
+	}
 	go func() {
 		defer func() { _ = recover(); pw.Close() }() // goccy/sh fork: never crash the host
 		pw.Write(buf.Bytes())

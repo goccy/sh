@@ -206,12 +206,23 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 		if pe.Repl.All {
 			n = -1
 		}
+		// A global match over a large subject allocates a match-index array
+		// proportional to the number of matches (up to ~len(str)); bound the
+		// subject before findAllIndex materializes it.
+		if n < 0 && cfg.tooLargeMatch(int64(len(str))) {
+			return "", fmt.Errorf("substitution subject exceeds the %d-byte limit", cfg.MaxBytes/matchIndexFactor)
+		}
 		locs := findAllIndex(orig, str, n)
 		sb := cfg.strBuilder()
 		last := 0
 		for _, loc := range locs {
 			sb.WriteString(str[last:loc[0]])
 			sb.WriteString(with)
+			// The result grows to ~len(str)*len(with); bound it incrementally so a
+			// small pattern with a large replacement cannot exhaust host memory.
+			if cfg.tooLarge(int64(sb.Len())) {
+				return "", fmt.Errorf("expansion exceeds the %d-byte limit", cfg.MaxBytes)
+			}
 			last = loc[1]
 		}
 		sb.WriteString(str[last:])
@@ -266,6 +277,9 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 			}
 		case syntax.RemSmallPrefix, syntax.RemLargePrefix,
 			syntax.RemSmallSuffix, syntax.RemLargeSuffix:
+			if cfg.tooLargePattern(int64(len(arg))) {
+				return "", fmt.Errorf("pattern exceeds the %d-byte limit", cfg.MaxBytes/patternRegexpFactor)
+			}
 			suffix := op == syntax.RemSmallSuffix || op == syntax.RemLargeSuffix
 			small := op == syntax.RemSmallPrefix || op == syntax.RemSmallSuffix
 			for i, elem := range elems {
@@ -275,12 +289,18 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 		case syntax.UpperFirst, syntax.UpperAll,
 			syntax.LowerFirst, syntax.LowerAll:
 
+			if cfg.tooLargeTransform(int64(len(str))) {
+				return "", fmt.Errorf("value transform exceeds the %d-byte limit", cfg.MaxBytes/transformWorkFactor)
+			}
 			caseFunc := unicode.ToLower
 			if op == syntax.UpperFirst || op == syntax.UpperAll {
 				caseFunc = unicode.ToUpper
 			}
 			all := op == syntax.UpperAll || op == syntax.LowerAll
 
+			if cfg.tooLargePattern(int64(len(arg))) {
+				return "", fmt.Errorf("pattern exceeds the %d-byte limit", cfg.MaxBytes/patternRegexpFactor)
+			}
 			// empty string means '?'; nothing to do there
 			expr, err := pattern.Regexp(arg, 0)
 			if err != nil {
@@ -302,6 +322,12 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 			}
 			str = strings.Join(elems, " ")
 		case syntax.OtherParamOps:
+			// The value-transforming @-ops (@Q/@E/@A/@U/@u/@L) allocate several
+			// times the value; bound the value so a budget-sized string cannot
+			// blow the working set past MaxBytes. @a/@P do not touch the value.
+			if arg != "a" && arg != "P" && cfg.tooLargeTransform(int64(len(str))) {
+				return "", fmt.Errorf("value transform exceeds the %d-byte limit", cfg.MaxBytes/transformWorkFactor)
+			}
 			switch arg {
 			case "Q":
 				str, err = syntax.Quote(str, syntax.LangBash)

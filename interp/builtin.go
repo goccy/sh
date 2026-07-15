@@ -248,6 +248,11 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 		}
 		format, args := args[0], args[1:]
 		for {
+			// The format is cycled over the arguments; a huge argument list would
+			// otherwise spin here uninterruptibly, so honor cancellation.
+			if r.stop(ctx) {
+				break
+			}
 			s, n, err := expand.Format(r.ecfg, format, args)
 			if err != nil {
 				return failf(1, "%v\n", err)
@@ -711,6 +716,13 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 			}
 			// Use -1 as max to get all fields without joining the last ones.
 			values := expand.ReadFields(r.ecfg, string(line), -1, raw)
+			// Enforce the array caps that every other array-building path honors;
+			// ReadFields already bounds its own allocation against the budget, but
+			// read -a keeps the whole result, so reject an over-cap array (fatal)
+			// rather than storing it.
+			if r.checkArrayList(values) {
+				return r.exit
+			}
 			r.setVar(arrayName, expand.Variable{
 				Set:  true,
 				Kind: expand.Indexed,
@@ -979,8 +991,20 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 		vr.Kind = expand.Indexed
 		scanner := bufio.NewScanner(r.stdin)
 		scanner.Split(mapfileSplit(delim[0], dropDelim))
+		var total int64
 		for scanner.Scan() {
-			vr.List = append(vr.List, scanner.Text())
+			line := scanner.Text()
+			total += int64(len(line))
+			vr.List = append(vr.List, line)
+			// Bound the array as it grows: an unbounded stdin producer must not
+			// accumulate past the element-count / cumulative-byte caps. Track the
+			// running total so this stays O(1) per line rather than re-scanning
+			// (and so no amortization window lets a small-then-large ramp overshoot).
+			// checkArrayGrow marks r.exit fatal, so return it (not the zero-value
+			// local exit) or the caller would overwrite the fatal and continue.
+			if r.checkArrayGrow(len(vr.List), total) {
+				return r.exit
+			}
 		}
 		if err := scanner.Err(); err != nil {
 			return failf(2, "%s: unable to read, %v\n", name, err)
@@ -1048,6 +1072,12 @@ func (r *Runner) readLine(ctx context.Context, raw bool) ([]byte, error) {
 		}
 	}()
 	for {
+		// Bound the line: an always-ready endless source (e.g. /dev/zero) never
+		// blocks, so the SetReadDeadline guard above cannot stop it — cap the
+		// buffer so it cannot grow without limit.
+		if r.ecfg != nil && r.ecfg.MaxBytes > 0 && int64(len(line)) > r.ecfg.MaxBytes {
+			return line, fmt.Errorf("read line exceeds the %d-byte limit", r.ecfg.MaxBytes)
+		}
 		var buf [1]byte
 		n, err := r.stdin.Read(buf[:])
 		if n > 0 {

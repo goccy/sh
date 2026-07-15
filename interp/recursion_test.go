@@ -44,3 +44,38 @@ func TestRecursionLimit(t *testing.T) {
 		t.Fatal("RecursionLimit(50) should trip on unbounded recursion")
 	}
 }
+
+// TestArithmChainLimit asserts that a very long left-associative arithmetic
+// chain — which the parser builds in a loop, so its recursion guard would not
+// otherwise climb — is rejected rather than overflowing the goroutine stack when
+// the evaluator walks the deep AST it produces.
+func TestArithmChainLimit(t *testing.T) {
+	run := func(src string) error {
+		f, err := syntax.NewParser().Parse(strings.NewReader(src), "")
+		if err != nil {
+			return err
+		}
+		r, err := interp.New(interp.StdIO(nil, nil, nil))
+		if err != nil {
+			return err
+		}
+		return r.Run(context.Background(), f)
+	}
+
+	// A chain far longer than the parser recursion limit must error, not crash.
+	for _, tc := range []struct{ name, src string }{
+		{"add", "echo $((" + strings.Repeat("1+", 200000) + "1))"},
+		{"comma", "echo $((" + strings.Repeat("1,", 200000) + "1))"},
+		{"logic", "echo $((" + strings.Repeat("1||", 200000) + "1))"},
+		{"let", "let x=" + strings.Repeat("1+", 200000) + "1"},
+	} {
+		if err := run(tc.src); err == nil {
+			t.Errorf("%s: expected an arithmetic recursion-limit error", tc.name)
+		}
+	}
+
+	// Ordinary arithmetic still evaluates.
+	if err := run("echo $((1+2*3-4)); x=5; echo $((x*x))"); err != nil {
+		t.Errorf("ordinary arithmetic should work: %v", err)
+	}
+}

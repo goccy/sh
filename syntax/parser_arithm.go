@@ -15,6 +15,11 @@ func (p *Parser) arithmExprComma(compact bool) ArithmExpr {
 }
 
 func (p *Parser) arithmExprAssign(compact bool) ArithmExpr {
+	// These arithmetic productions are right-associative and recurse into
+	// themselves without passing back through arithmExpr, so each needs its own
+	// depth guard or a long chain (a=a=…, x**y**…, c?t:c?t:…, !!!…) overflows.
+	p.enter()
+	defer p.leave()
 	// Assign is different from the other binary operators because it's
 	// right-associative and needs to check that it's placed after a name
 	value := p.arithmExprTernary(compact)
@@ -46,6 +51,8 @@ func (p *Parser) arithmExprAssign(compact bool) ArithmExpr {
 }
 
 func (p *Parser) arithmExprTernary(compact bool) ArithmExpr {
+	p.enter()
+	defer p.leave()
 	value := p.arithmExprLor(compact)
 	if BinAritOperator(p.tok) != TernQuest || (compact && p.spaced) {
 		return value
@@ -126,6 +133,8 @@ func (p *Parser) arithmExprMultiplication(compact bool) ArithmExpr {
 }
 
 func (p *Parser) arithmExprPower(compact bool) ArithmExpr {
+	p.enter()
+	defer p.leave()
 	// Power is different from the other binary operators because it's right-associative
 	value := p.arithmExprUnary(compact)
 	if BinAritOperator(p.tok) != Pow || (compact && p.spaced) {
@@ -152,6 +161,8 @@ func (p *Parser) arithmExprPower(compact bool) ArithmExpr {
 }
 
 func (p *Parser) arithmExprUnary(compact bool) ArithmExpr {
+	p.enter()
+	defer p.leave()
 	if !compact {
 		p.got(_Newl)
 	}
@@ -264,9 +275,16 @@ func (p *Parser) nextArithOp(compact bool) {
 	}
 }
 
-// arithmExprBinary is used for all left-associative binary operators
+// arithmExprBinary is used for all left-associative binary operators. It builds
+// the chain in a loop rather than by recursion, so p.recDepth would not climb
+// with the operator count; a chain like 1+1+1+…+1 would then produce an AST (and
+// a corresponding evaluator recursion) of unbounded depth, overflowing the stack
+// with an uncatchable runtime throw. Each iteration therefore enters one nesting
+// level so the shared recursion guard bounds the chain length just as it bounds
+// genuine recursion; the levels are released once the whole chain is parsed.
 func (p *Parser) arithmExprBinary(compact bool, nextOp func(bool) ArithmExpr, operators ...BinAritOperator) ArithmExpr {
 	value := nextOp(compact)
+	entered := 0
 	for {
 		var foundOp BinAritOperator
 		for _, op := range operators {
@@ -277,6 +295,9 @@ func (p *Parser) arithmExprBinary(compact bool, nextOp func(bool) ArithmExpr, op
 		}
 
 		if token(foundOp) == illegalTok || (compact && p.spaced) {
+			for ; entered > 0; entered-- {
+				p.leave()
+			}
 			return value
 		}
 
@@ -297,6 +318,8 @@ func (p *Parser) arithmExprBinary(compact bool, nextOp func(bool) ArithmExpr, op
 			X:     value,
 			Y:     y,
 		}
+		p.enter()
+		entered++
 	}
 }
 
